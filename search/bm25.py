@@ -124,6 +124,23 @@ class BM25Search:
         """检查是否已索引"""
         return self._indexed and self.retriever is not None
 
+    def search_paths(self, query: str, limit: int = 10) -> list[tuple[str, float]]:
+        """搜索，只返回路径和分数（不需要文档内容）"""
+        if not self.retriever or not self.paths:
+            return []
+
+        query_tokens = bm25s.tokenize([query], stemmer=None, stopwords=None, show_progress=False)
+        results_ids, scores = self.retriever.retrieve(query_tokens, k=min(limit, len(self.paths)))
+
+        results = []
+        for i in range(results_ids.shape[1]):
+            doc_idx = results_ids[0, i]
+            score = scores[0, i]
+            if score > 0 and doc_idx < len(self.paths):
+                results.append((self.paths[doc_idx], float(score)))
+
+        return results
+
     def search(
         self,
         query: str,

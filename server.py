@@ -1,16 +1,15 @@
-"""Obsidian Vault MCP Server"""
+"""Obsidian Vault MCP Server - 极简版（低内存占用）"""
 
+import json
 import logging
 import threading
 import time
 from pathlib import Path
-from dataclasses import asdict
+from dataclasses import dataclass, asdict
 from typing import Annotated, Literal
 
-import networkx as nx
 from fastmcp import FastMCP
 from pydantic import Field
-from flashrank import Ranker, RerankRequest
 
 from config import Config, load_config
 from vault import VaultReader
@@ -24,18 +23,50 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 
-# ========== 知识图谱 ==========
+# ========== PageRank（持久化版） ==========
+
+@dataclass
+class GraphState:
+    """图谱状态（持久化到磁盘）"""
+    nodes: int = 0
+    edges: int = 0
+    scores: dict = None
+
+    def __post_init__(self):
+        if self.scores is None:
+            self.scores = {}
+
 
 class GraphRanker:
-    """基于链接结构的 PageRank 排序"""
+    """基于链接结构的 PageRank 排序（支持持久化）"""
 
-    def __init__(self):
-        self._graph: nx.DiGraph | None = None
-        self._pagerank: dict[str, float] = {}
+    def __init__(self, storage_path: Path):
+        self.cache_file = storage_path / "pagerank.json"
+        self._scores: dict[str, float] = {}
+        self._stats = {"nodes": 0, "edges": 0}
         self._lock = threading.Lock()
+        self._ready = False
 
-    def build(self, links_map: dict[str, list[str]]):
+    def load(self) -> bool:
+        """从磁盘加载"""
+        if not self.cache_file.exists():
+            return False
+        try:
+            data = json.loads(self.cache_file.read_text())
+            with self._lock:
+                self._scores = data.get("scores", {})
+                self._stats = {"nodes": data.get("nodes", 0), "edges": data.get("edges", 0)}
+                self._ready = True
+            logger.info(f"PageRank 从缓存加载 ({self._stats['nodes']} 节点)")
+            return True
+        except Exception as e:
+            logger.warning(f"加载 PageRank 失败: {e}")
+            return False
+
+    def build(self, links_map: dict[str, list[str]]) -> float:
         """构建图谱并计算 PageRank"""
+        import networkx as nx
+
         start = time.time()
         G = nx.DiGraph()
 
@@ -44,103 +75,93 @@ class GraphRanker:
             for target in targets:
                 G.add_edge(source, target)
 
-        # 计算 PageRank
         try:
             scores = nx.pagerank(G, alpha=0.85, max_iter=100)
         except Exception:
             scores = {}
 
         with self._lock:
-            self._graph = G
-            self._pagerank = scores
+            self._scores = scores
+            self._stats = {"nodes": len(G.nodes), "edges": len(G.edges)}
+            self._ready = True
+
+        # 持久化
+        self._save()
 
         elapsed = (time.time() - start) * 1000
         logger.info(f"PageRank 计算完成 ({len(G.nodes)} 节点, {len(G.edges)} 边, {elapsed:.0f}ms)")
         return elapsed
 
+    def _save(self):
+        """保存到磁盘"""
+        try:
+            self.cache_file.parent.mkdir(parents=True, exist_ok=True)
+            data = {
+                "scores": self._scores,
+                "nodes": self._stats["nodes"],
+                "edges": self._stats["edges"],
+            }
+            self.cache_file.write_text(json.dumps(data))
+        except Exception as e:
+            logger.warning(f"保存 PageRank 失败: {e}")
+
     def get_score(self, path: str) -> float:
-        """获取节点的 PageRank 分数"""
         with self._lock:
-            return self._pagerank.get(path, 0.0)
+            return self._scores.get(path, 0.0)
+
+    def is_ready(self) -> bool:
+        with self._lock:
+            return self._ready
 
     def get_stats(self) -> dict:
-        """获取图谱统计"""
         with self._lock:
-            if self._graph is None:
-                return {"nodes": 0, "edges": 0}
-            return {
-                "nodes": len(self._graph.nodes),
-                "edges": len(self._graph.edges),
-            }
+            return self._stats.copy()
 
 
 # ========== RRF 融合 ==========
 
 def rrf_fusion(
-    bm25_results: list,
+    bm25_results: list[tuple[str, float]],
     vector_results: list,
     k: int = 60
-) -> list[tuple[str, float, str]]:
-    """
-    Reciprocal Rank Fusion 融合算法
-    score = sum(1 / (rank + k))
-    """
+) -> list[tuple[str, float]]:
+    """RRF 融合算法（不含 snippet）"""
     scores: dict[str, float] = {}
-    snippets: dict[str, str] = {}
 
-    # BM25 排名贡献
-    for rank, r in enumerate(bm25_results, 1):
-        scores[r.path] = scores.get(r.path, 0) + 1 / (rank + k)
-        if r.path not in snippets:
-            snippets[r.path] = r.snippet
+    for rank, (path, _) in enumerate(bm25_results, 1):
+        scores[path] = scores.get(path, 0) + 1 / (rank + k)
 
-    # 向量排名贡献
     for rank, r in enumerate(vector_results, 1):
         scores[r.path] = scores.get(r.path, 0) + 1 / (rank + k)
-        if r.path not in snippets:
-            snippets[r.path] = r.snippet
 
-    # 按分数排序
-    sorted_items = sorted(scores.items(), key=lambda x: x[1], reverse=True)
-    return [(path, score, snippets[path]) for path, score in sorted_items]
+    return sorted(scores.items(), key=lambda x: x[1], reverse=True)
 
+
+# ========== 索引状态（极简版） ==========
 
 class IndexState:
-    """索引状态管理"""
+    """索引状态（不存储文档内容）"""
+
     def __init__(self):
         self.bm25_ready = False
         self.vector_ready = False
-        self.reranker_ready = False
-        self.graph_ready = False
-        self.doc_contents: dict[str, str] = {}
+        self.total_docs = 0
         self._lock = threading.Lock()
-        # 性能指标
         self.metrics = {
             "bm25_index_time": 0.0,
             "vector_index_time": 0.0,
-            "reranker_load_time": 0.0,
             "pagerank_time": 0.0,
-            "total_docs": 0,
             "last_update": "",
         }
 
-    def set_bm25_ready(self, contents: dict[str, str]):
+    def set_bm25_ready(self, doc_count: int):
         with self._lock:
-            self.doc_contents = contents
             self.bm25_ready = True
-            self.metrics["total_docs"] = len(contents)
+            self.total_docs = doc_count
 
     def set_vector_ready(self):
         with self._lock:
             self.vector_ready = True
-
-    def set_reranker_ready(self):
-        with self._lock:
-            self.reranker_ready = True
-
-    def set_graph_ready(self):
-        with self._lock:
-            self.graph_ready = True
 
     def is_bm25_ready(self) -> bool:
         with self._lock:
@@ -149,18 +170,6 @@ class IndexState:
     def is_vector_ready(self) -> bool:
         with self._lock:
             return self.vector_ready
-
-    def is_reranker_ready(self) -> bool:
-        with self._lock:
-            return self.reranker_ready
-
-    def is_graph_ready(self) -> bool:
-        with self._lock:
-            return self.graph_ready
-
-    def get_contents(self) -> dict[str, str]:
-        with self._lock:
-            return self.doc_contents.copy()
 
     def update_metrics(self, **kwargs):
         with self._lock:
@@ -172,19 +181,18 @@ class IndexState:
 
 
 def create_server(vault_path: Path, config: Config | None = None) -> FastMCP:
-    """创建 MCP 服务器"""
+    """创建 MCP 服务器（极简版）"""
 
     config = config or load_config(vault_path)
     storage = config.storage_path
 
     # 初始化组件
     vault = VaultReader(vault_path)
-    bm25 = BM25Search(storage)  # 支持持久化和 mmap
+    bm25 = BM25Search(storage)
     vector = VectorSearch(storage, model_name=config.embedding_model)
     memory = MemoryStore(storage)
     state = IndexState()
-    graph_ranker = GraphRanker()
-    reranker: Ranker | None = None  # 延迟加载
+    graph_ranker = GraphRanker(storage)
 
     indexer = Indexer(
         storage, bm25, vector,
@@ -192,7 +200,7 @@ def create_server(vault_path: Path, config: Config | None = None) -> FastMCP:
         vector_ready_fn=state.is_vector_ready,
     )
 
-    # 后台初始化 BM25（支持缓存加载）
+    # 后台初始化 BM25
     def init_bm25():
         logger.info("后台初始化 BM25...")
         start = time.time()
@@ -201,41 +209,33 @@ def create_server(vault_path: Path, config: Config | None = None) -> FastMCP:
         doc_contents = {d.path: d.content for d in docs}
         file_stats = {d.path: (d.mtime, len(d.content)) for d in docs}
 
-        # 尝试从缓存加载（使用 mmap 节省内存）
         if bm25.load_index(use_mmap=True):
-            # 检查增量更新
             result = indexer.index_incremental(doc_contents, file_stats)
             if result["status"] == "updated":
-                # 有变化，重建索引
                 bm25.index(doc_contents)
         else:
-            # 没有缓存，全量索引
             bm25.index(doc_contents)
 
+        # 注意：不存储 doc_contents，只记录数量
         bm25_time = time.time() - start
-        state.set_bm25_ready(doc_contents)
+        state.set_bm25_ready(len(doc_contents))
         state.update_metrics(bm25_index_time=bm25_time)
         logger.info(f"BM25 就绪 ({bm25_time:.2f}s, {len(doc_contents)} 文档)")
 
-    # 后台初始化向量索引（慢速，可能几分钟）
+    # 后台初始化向量索引
     def init_vector():
-        # 等 BM25 先完成
         while not state.is_bm25_ready():
             time.sleep(0.5)
 
-        doc_contents = state.get_contents()
-        if not doc_contents:
-            return
-
-        # 检查是否已有向量索引
         if vector.is_indexed():
             state.set_vector_ready()
-            state.update_metrics(
-                vector_index_time=0,
-                last_update=time.strftime("%Y-%m-%d %H:%M:%S"),
-            )
+            state.update_metrics(last_update=time.strftime("%Y-%m-%d %H:%M:%S"))
             logger.info("向量索引从缓存加载")
             return
+
+        # 需要重新加载文档构建向量索引
+        docs = vault.load_all_documents()
+        doc_contents = {d.path: d.content for d in docs}
 
         logger.info(f"后台构建向量索引 ({len(doc_contents)} 文档)...")
         start = time.time()
@@ -249,45 +249,32 @@ def create_server(vault_path: Path, config: Config | None = None) -> FastMCP:
         )
         logger.info(f"向量索引就绪 ({vector_time:.2f}s)")
 
-    # 后台初始化 Reranker（轻量，几秒）
-    def init_reranker():
-        nonlocal reranker
-        logger.info("后台加载 Reranker...")
-        start = time.time()
-        try:
-            reranker = Ranker(model_name="ms-marco-TinyBERT-L-2-v2")
-            load_time = time.time() - start
-            state.set_reranker_ready()
-            state.update_metrics(reranker_load_time=load_time)
-            logger.info(f"Reranker 就绪 ({load_time:.2f}s)")
-        except Exception as e:
-            logger.warning(f"Reranker 加载失败: {e}")
-
-    # 后台初始化知识图谱（快速，<1s）
+    # 后台初始化 PageRank
     def init_graph():
-        # 等 BM25 先完成
+        # 先尝试从缓存加载
+        if graph_ranker.load():
+            return
+
         while not state.is_bm25_ready():
             time.sleep(0.5)
 
         logger.info("后台构建知识图谱...")
         links = vault.get_all_outgoing_links()
         elapsed = graph_ranker.build(links)
-        state.set_graph_ready()
         state.update_metrics(pagerank_time=elapsed)
 
     # 启动后台线程
     threading.Thread(target=init_bm25, daemon=True).start()
     threading.Thread(target=init_vector, daemon=True).start()
-    threading.Thread(target=init_reranker, daemon=True).start()
     threading.Thread(target=init_graph, daemon=True).start()
 
-    # 启动定时更新
+    # 定时更新（简化版：只更新索引，不存储内容）
     def get_docs():
         docs = vault.load_all_documents()
         contents = {d.path: d.content for d in docs}
         stats = {d.path: (d.mtime, len(d.content)) for d in docs}
-        state.set_bm25_ready(contents)
-        # 同时更新图谱
+        state.set_bm25_ready(len(contents))
+        # 更新图谱
         links = vault.get_all_outgoing_links()
         graph_ranker.build(links)
         return contents, stats
@@ -297,17 +284,42 @@ def create_server(vault_path: Path, config: Config | None = None) -> FastMCP:
     # 创建 MCP 服务器
     mcp = FastMCP(
         name="obsidian-vault-mcp",
-        instructions="""Obsidian Vault 搜索和记忆服务。
+        instructions="""Obsidian Vault 搜索和记忆服务（轻量版）。
 
 功能：
-- search: 搜索笔记（支持关键词/语义/混合模式）
+- search: 搜索笔记（BM25 + 向量混合）
 - get_backlinks: 获取反向链接
 - get_tags: 获取标签
 - find_orphans: 查找孤立笔记
 - memory_*: 存储和获取记忆""",
     )
 
-    # ========== 搜索（核心） ==========
+    # ========== 辅助函数 ==========
+
+    def get_snippet(content: str, query: str, max_len: int = 150) -> str:
+        """提取包含查询词的片段"""
+        query_terms = set(query.lower().split())
+        for line in content.split('\n'):
+            line_lower = line.lower()
+            if any(term in line_lower for term in query_terms if len(term) > 1):
+                return line[:max_len] + "..." if len(line) > max_len else line
+        return content[:max_len] + "..." if len(content) > max_len else content
+
+    def read_files_for_results(paths: list[str], query: str) -> list[dict]:
+        """按需读取文件并生成结果"""
+        results = []
+        for path in paths:
+            try:
+                content = vault.read_note(path)
+                results.append({
+                    "path": path,
+                    "snippet": get_snippet(content, query),
+                })
+            except Exception:
+                results.append({"path": path, "snippet": ""})
+        return results
+
+    # ========== 搜索 ==========
 
     @mcp.tool(name="search", description="搜索笔记")
     def search(
@@ -317,18 +329,25 @@ def create_server(vault_path: Path, config: Config | None = None) -> FastMCP:
             Field(default="hybrid", description="搜索模式")
         ] = "hybrid",
         limit: Annotated[int, Field(default=10, ge=1, le=50)] = 10,
-        use_rerank: Annotated[bool, Field(default=True, description="是否使用 Reranker")] = True,
     ) -> dict:
         start = time.time()
 
         # BM25 搜索
         if mode == "bm25":
             if not state.is_bm25_ready():
-                return {"error": "BM25 索引初始化中", "results": [], "count": 0}
-            doc_contents = state.get_contents()
-            results = bm25.search(query, doc_contents, limit)
+                return {"error": "索引初始化中", "results": [], "count": 0}
+
+            # BM25 只返回路径和分数
+            raw_results = bm25.search_paths(query, limit)
+            paths = [p for p, _ in raw_results]
+
+            # 按需读取文件
+            results = read_files_for_results(paths, query)
+            for i, (_, score) in enumerate(raw_results):
+                results[i]["score"] = float(score)
+
             return {
-                "results": [asdict(r) for r in results],
+                "results": results,
                 "count": len(results),
                 "time_ms": int((time.time() - start) * 1000),
             }
@@ -336,7 +355,8 @@ def create_server(vault_path: Path, config: Config | None = None) -> FastMCP:
         # 语义搜索
         if mode == "semantic":
             if not state.is_vector_ready():
-                return {"error": "向量索引初始化中，请使用 bm25 模式", "results": [], "count": 0}
+                return {"error": "向量索引初始化中", "results": [], "count": 0}
+
             results = vector.search(query, limit)
             return {
                 "results": [asdict(r) for r in results],
@@ -344,110 +364,71 @@ def create_server(vault_path: Path, config: Config | None = None) -> FastMCP:
                 "time_ms": int((time.time() - start) * 1000),
             }
 
-        # ========== 混合搜索（优化版） ==========
+        # ========== 混合搜索 ==========
         if not state.is_bm25_ready():
             return {"error": "索引初始化中", "results": [], "count": 0}
 
-        # 获取文档内容（用于 BM25 snippet）
-        doc_contents = state.get_contents()
+        # 1. BM25 召回（只要路径）
+        bm25_results = bm25.search_paths(query, limit * 3)
 
-        # 1. 多路召回
-        bm25_results = bm25.search(query, doc_contents, limit * 5)  # 扩大召回量
-
-        # 如果向量索引未就绪，降级为纯 BM25
+        # 降级为纯 BM25
         if not state.is_vector_ready():
+            paths = [p for p, _ in bm25_results[:limit]]
+            results = read_files_for_results(paths, query)
+            for i, (_, score) in enumerate(bm25_results[:limit]):
+                results[i]["score"] = float(score)
             return {
-                "results": [asdict(r) for r in bm25_results[:limit]],
-                "count": min(len(bm25_results), limit),
+                "results": results,
+                "count": len(results),
                 "time_ms": int((time.time() - start) * 1000),
-                "note": "向量索引未就绪，已降级为 BM25",
+                "note": "向量索引未就绪",
             }
 
-        vector_results = vector.search(query, limit * 5)
+        # 2. 向量召回
+        vector_results = vector.search(query, limit * 3)
 
-        # 2. RRF 融合（替代简单加权）
+        # 3. RRF 融合
         fused = rrf_fusion(bm25_results, vector_results, k=60)
 
-        # 3. PageRank 加权（如果图谱就绪）
-        if state.is_graph_ready():
-            # 对 RRF 分数应用 PageRank 权重
-            max_pr = max((graph_ranker.get_score(p) for p, _, _ in fused[:50]), default=0.001) or 0.001
+        # 4. PageRank 加权
+        if graph_ranker.is_ready():
+            max_pr = max((graph_ranker.get_score(p) for p, _ in fused[:30]), default=0.001) or 0.001
             weighted = []
-            for path, score, snippet in fused:
-                pr_score = graph_ranker.get_score(path)
-                # PageRank 贡献 10% 权重
-                pr_boost = 1 + (pr_score / max_pr) * 0.1
-                weighted.append((path, score * pr_boost, snippet))
+            for path, score in fused:
+                pr_boost = 1 + (graph_ranker.get_score(path) / max_pr) * 0.1
+                weighted.append((path, score * pr_boost))
             fused = sorted(weighted, key=lambda x: x[1], reverse=True)
 
-        # 4. Reranker 精排（如果可用且启用）
-        if use_rerank and state.is_reranker_ready() and reranker and len(fused) > 0:
-            # 取 Top 50 进行 rerank
-            candidates = fused[:50]
-            passages = [{"id": p, "text": s} for p, _, s in candidates]
-
-            try:
-                rerank_request = RerankRequest(query=query, passages=passages)
-                reranked = reranker.rerank(rerank_request)
-
-                # 重新排序
-                path_to_snippet = {p: s for p, _, s in candidates}
-                results = [
-                    {
-                        "path": r["id"],
-                        "score": float(r["score"]),
-                        "snippet": path_to_snippet.get(r["id"], ""),
-                    }
-                    for r in reranked[:limit]
-                ]
-            except Exception as e:
-                logger.warning(f"Rerank 失败: {e}")
-                results = [
-                    {"path": p, "score": s, "snippet": sn}
-                    for p, s, sn in fused[:limit]
-                ]
-        else:
-            results = [
-                {"path": p, "score": s, "snippet": sn}
-                for p, s, sn in fused[:limit]
-            ]
+        # 5. 取 top-K，按需读取文件
+        top_paths = [p for p, _ in fused[:limit]]
+        results = read_files_for_results(top_paths, query)
+        for i, (_, score) in enumerate(fused[:limit]):
+            results[i]["score"] = float(score)
 
         return {
             "results": results,
             "count": len(results),
             "time_ms": int((time.time() - start) * 1000),
-            "features": {
-                "rrf": True,
-                "rerank": use_rerank and state.is_reranker_ready(),
-                "pagerank": state.is_graph_ready(),
-            },
+            "features": {"rrf": True, "pagerank": graph_ranker.is_ready()},
         }
 
     # ========== 链接分析 ==========
 
     @mcp.tool(name="get_backlinks", description="获取笔记的反向链接")
-    def get_backlinks(
-        path: Annotated[str, Field(description="笔记路径")]
-    ) -> dict:
+    def get_backlinks(path: Annotated[str, Field(description="笔记路径")]) -> dict:
         links = vault.get_links(path)
-        return {
-            "path": path,
-            "backlinks": links.backlinks,
-            "outgoing": links.outgoing,
-        }
+        return {"path": path, "backlinks": links.backlinks, "outgoing": links.outgoing}
 
     # ========== 标签 ==========
 
     @mcp.tool(name="get_tags", description="获取标签或按标签查找")
     def get_tags(
-        tag: Annotated[str | None, Field(default=None, description="指定标签则返回该标签的笔记")] = None,
+        tag: Annotated[str | None, Field(default=None)] = None,
     ) -> dict:
         if tag:
             notes = vault.find_by_tag(tag)
             return {"tag": tag, "notes": notes, "count": len(notes)}
-        else:
-            tags = vault.get_all_tags()
-            return {"tags": tags, "count": len(tags)}
+        return {"tags": vault.get_all_tags(), "count": len(vault.get_all_tags())}
 
     # ========== Vault 分析 ==========
 
@@ -461,8 +442,7 @@ def create_server(vault_path: Path, config: Config | None = None) -> FastMCP:
         days: Annotated[int, Field(default=7, ge=1)] = 7,
         limit: Annotated[int, Field(default=20, ge=1, le=100)] = 20,
     ) -> dict:
-        notes = vault.get_recent_notes(days, limit)
-        return {"notes": notes, "count": len(notes)}
+        return {"notes": vault.get_recent_notes(days, limit)}
 
     # ========== Memory ==========
 
@@ -472,27 +452,21 @@ def create_server(vault_path: Path, config: Config | None = None) -> FastMCP:
         value: Annotated[str, Field(description="值")],
         category: Annotated[str, Field(default="general")] = "general",
     ) -> dict:
-        mem = memory.set(key, value, category)
-        return asdict(mem)
+        return asdict(memory.set(key, value, category))
 
     @mcp.tool(name="memory_get", description="获取记忆")
     def memory_get(key: Annotated[str, Field(description="键")]) -> dict:
         mem = memory.get(key)
-        if mem:
-            return asdict(mem)
-        return {"error": "not found", "key": key}
+        return asdict(mem) if mem else {"error": "not found", "key": key}
 
     @mcp.tool(name="memory_list", description="列出记忆")
-    def memory_list(
-        category: Annotated[str, Field(default="general")] = "general",
-    ) -> dict:
+    def memory_list(category: Annotated[str, Field(default="general")] = "general") -> dict:
         memories = memory.list_by_category(category)
         return {"memories": [asdict(m) for m in memories], "count": len(memories)}
 
     @mcp.tool(name="memory_delete", description="删除记忆")
     def memory_delete(key: Annotated[str, Field(description="键")]) -> dict:
-        deleted = memory.delete(key)
-        return {"deleted": deleted, "key": key}
+        return {"deleted": memory.delete(key), "key": key}
 
     # ========== 统计 ==========
 
@@ -504,8 +478,7 @@ def create_server(vault_path: Path, config: Config | None = None) -> FastMCP:
             "index": {
                 "bm25_ready": state.is_bm25_ready(),
                 "vector_ready": state.is_vector_ready(),
-                "reranker_ready": state.is_reranker_ready(),
-                "graph_ready": state.is_graph_ready(),
+                "graph_ready": graph_ranker.is_ready(),
                 "bm25_docs": len(bm25.paths),
                 "vector": vector.get_stats(),
                 "graph": graph_ranker.get_stats(),
@@ -513,7 +486,6 @@ def create_server(vault_path: Path, config: Config | None = None) -> FastMCP:
             "performance": {
                 "bm25_index_time_s": round(metrics["bm25_index_time"], 2),
                 "vector_index_time_s": round(metrics["vector_index_time"], 2),
-                "reranker_load_time_s": round(metrics["reranker_load_time"], 2),
                 "pagerank_time_ms": round(metrics["pagerank_time"], 2),
                 "last_update": metrics["last_update"],
             },
@@ -532,7 +504,6 @@ def main():
     parser.add_argument("--vault", type=str, default=None, help="Vault 路径")
     args = parser.parse_args()
 
-    # 优先级：命令行参数 > 环境变量 > 当前目录
     vault_str = args.vault or os.environ.get("OBSIDIAN_VAULT_PATH") or "."
     vault_path = Path(vault_str).resolve()
 
@@ -540,7 +511,6 @@ def main():
         print(f"错误: 路径不存在 {vault_path}")
         exit(1)
 
-    # 验证是否是 Obsidian vault
     obsidian_dir = vault_path / ".obsidian"
     if not obsidian_dir.exists():
         print(f"警告: {vault_path} 不是 Obsidian vault（缺少 .obsidian 目录）")
