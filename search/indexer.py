@@ -29,11 +29,13 @@ class Indexer:
         bm25: BM25Search,
         vector: VectorSearch,
         interval: int = 300,
+        vector_ready_fn: callable = None,
     ):
         self.storage_path = storage_path
         self.bm25 = bm25
         self.vector = vector
         self.interval = interval
+        self._vector_ready_fn = vector_ready_fn or (lambda: True)
 
         self.cache_file = storage_path / "index_cache.json"
         self._file_states: dict[str, FileState] = {}
@@ -140,14 +142,15 @@ class Indexer:
         # 添加和修改 - 批量处理
         to_update = added + modified
         if to_update:
-            # 更新 BM25（先添加到 documents，最后一次性重建）
-            for path in to_update:
-                self.bm25.documents[path] = all_docs[path]
-            self.bm25.index(self.bm25.documents)
+            # 更新 BM25（直接使用完整文档集重建）
+            self.bm25.index(all_docs)
 
-            # 更新向量索引
-            for path in to_update:
-                self.vector.add(path, all_docs[path])
+            # 更新向量索引（仅当向量索引已就绪时）
+            if self._vector_ready_fn():
+                for path in modified:
+                    self.vector.remove(path)
+                for path in to_update:
+                    self.vector.add(path, all_docs[path])
 
             # 更新缓存状态
             for path in to_update:

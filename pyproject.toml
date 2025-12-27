@@ -18,11 +18,16 @@ classifiers = [
 ]
 requires-python = ">=3.12"
 dependencies = [
+    "bm25s>=0.2.14",
     "fastembed>=0.7.4",
     "fastmcp>=2.14.1",
+    "flashrank>=0.2.10",
     "jieba>=0.42.1",
     "lancedb>=0.26.0",
-    "rank-bm25>=0.2.2",
+    "networkx>=3.6.1",
+    "psutil>=7.2.0",
+    "rerankers>=0.10.0",
+    "scipy>=1.16.3",
 ]
 
 [project.urls]

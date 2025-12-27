@@ -1,9 +1,14 @@
-"""BM25 关键词搜索"""
+"""BM25S 关键词搜索（内存优化版）"""
 
 import re
+import logging
+from pathlib import Path
 from dataclasses import dataclass
-from rank_bm25 import BM25Okapi
+
+import bm25s
 import jieba
+
+logger = logging.getLogger(__name__)
 
 
 @dataclass
@@ -15,22 +20,34 @@ class SearchResult:
 
 
 class BM25Search:
-    """BM25 搜索引擎"""
+    """BM25S 搜索引擎（基于稀疏矩阵，支持 mmap）"""
 
-    def __init__(self):
-        self.documents: dict[str, str] = {}  # path -> content
-        self.paths: list[str] = []
-        self.bm25: BM25Okapi | None = None
+    def __init__(self, storage_path: Path | None = None):
+        self.storage_path = storage_path
+        self.index_dir = storage_path / "bm25_index" if storage_path else None
 
-    def _tokenize(self, text: str) -> list[str]:
+        self.retriever: bm25s.BM25 | None = None
+        self.paths: list[str] = []  # 文档路径列表
+        self._indexed = False
+
+    def _tokenize(self, texts: list[str]) -> list[list[str]]:
         """中文分词"""
-        # 简单清理
+        result = []
+        for text in texts:
+            # 清理特殊字符
+            text = re.sub(r'[#\[\](){}]', ' ', text)
+            tokens = list(jieba.cut(text))
+            result.append(tokens)
+        return result
+
+    def _tokenize_single(self, text: str) -> list[str]:
+        """单条文本分词"""
         text = re.sub(r'[#\[\](){}]', ' ', text)
         return list(jieba.cut(text))
 
-    def _get_snippet(self, content: str, query: str, max_len: int = 150) -> str:
+    @staticmethod
+    def get_snippet(content: str, query_terms: set[str], max_len: int = 150) -> str:
         """提取包含查询词的片段"""
-        query_terms = set(self._tokenize(query.lower()))
         lines = content.split('\n')
 
         for line in lines:
@@ -40,52 +57,108 @@ class BM25Search:
                     return line[:max_len] + "..."
                 return line
 
-        # 没找到就返回开头
         return content[:max_len] + "..." if len(content) > max_len else content
 
     def index(self, documents: dict[str, str]):
         """建立索引"""
-        self.documents = documents
         self.paths = list(documents.keys())
 
         if not self.paths:
-            self.bm25 = None
+            self.retriever = None
+            self._indexed = False
             return
 
-        tokenized = [self._tokenize(documents[p]) for p in self.paths]
-        self.bm25 = BM25Okapi(tokenized)
+        # 分词
+        contents = [documents[p] for p in self.paths]
+        corpus_tokens = self._tokenize(contents)
 
-    def add(self, path: str, content: str):
-        """添加单个文档"""
-        self.documents[path] = content
-        # 重建索引（BM25 不支持增量）
-        self.index(self.documents)
+        # 创建 BM25 索引
+        self.retriever = bm25s.BM25()
+        self.retriever.index(bm25s.tokenize(contents, stemmer=None, stopwords=None, show_progress=False))
+        self._indexed = True
 
-    def remove(self, path: str):
-        """移除文档"""
-        if path in self.documents:
-            del self.documents[path]
-            self.index(self.documents)
+        # 保存索引（如果有存储路径）
+        if self.index_dir:
+            self._save_index()
 
-    def search(self, query: str, limit: int = 10) -> list[SearchResult]:
+    def _save_index(self):
+        """保存索引到磁盘"""
+        if not self.retriever or not self.index_dir:
+            return
+
+        try:
+            self.index_dir.mkdir(parents=True, exist_ok=True)
+            self.retriever.save(str(self.index_dir))
+
+            # 单独保存路径列表
+            paths_file = self.index_dir / "paths.txt"
+            paths_file.write_text("\n".join(self.paths), encoding="utf-8")
+
+            logger.info(f"BM25 索引已保存: {self.index_dir}")
+        except Exception as e:
+            logger.warning(f"保存 BM25 索引失败: {e}")
+
+    def load_index(self, use_mmap: bool = True) -> bool:
+        """从磁盘加载索引（支持 mmap）"""
+        if not self.index_dir or not self.index_dir.exists():
+            return False
+
+        try:
+            # 加载路径列表
+            paths_file = self.index_dir / "paths.txt"
+            if not paths_file.exists():
+                return False
+            self.paths = paths_file.read_text(encoding="utf-8").strip().split("\n")
+
+            # 加载 BM25 索引（使用 mmap 节省内存）
+            self.retriever = bm25s.BM25.load(str(self.index_dir), mmap=use_mmap)
+            self._indexed = True
+
+            logger.info(f"BM25 索引已加载 (mmap={use_mmap}): {len(self.paths)} 文档")
+            return True
+        except Exception as e:
+            logger.warning(f"加载 BM25 索引失败: {e}")
+            return False
+
+    def is_indexed(self) -> bool:
+        """检查是否已索引"""
+        return self._indexed and self.retriever is not None
+
+    def search(
+        self,
+        query: str,
+        doc_contents: dict[str, str],
+        limit: int = 10
+    ) -> list[SearchResult]:
         """搜索"""
-        if not self.bm25 or not self.paths:
+        if not self.retriever or not self.paths:
             return []
 
-        tokens = self._tokenize(query)
-        scores = self.bm25.get_scores(tokens)
+        # 分词查询
+        query_tokens = bm25s.tokenize([query], stemmer=None, stopwords=None, show_progress=False)
+        query_terms = set(t.lower() for t in self._tokenize_single(query))
 
-        # 排序并取 top-k
-        ranked = sorted(zip(self.paths, scores), key=lambda x: x[1], reverse=True)
+        # 检索
+        results_ids, scores = self.retriever.retrieve(query_tokens, k=min(limit, len(self.paths)))
 
+        # 构建结果
         results = []
-        for path, score in ranked[:limit]:
-            if score > 0:
-                content = self.documents.get(path, "")
+        for i in range(results_ids.shape[1]):
+            doc_idx = results_ids[0, i]
+            score = scores[0, i]
+
+            if score > 0 and doc_idx < len(self.paths):
+                path = self.paths[doc_idx]
+                content = doc_contents.get(path, "")
                 results.append(SearchResult(
                     path=path,
                     score=float(score),
-                    snippet=self._get_snippet(content, query),
+                    snippet=self.get_snippet(content, query_terms),
                 ))
 
         return results
+
+    @property
+    def documents(self) -> dict[str, str]:
+        """兼容旧接口（返回空字典，不存储原始文档）"""
+        return {}

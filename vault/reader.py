@@ -160,3 +160,31 @@ class VaultReader:
         # 按时间排序
         notes.sort(key=lambda x: x["modified"], reverse=True)
         return notes[:limit]
+
+    def get_all_outgoing_links(self) -> dict[str, list[str]]:
+        """获取所有笔记的出链（用于构建知识图谱）"""
+        all_notes = set(self.list_notes())
+        note_stems = {Path(n).stem: n for n in all_notes}  # 文件名 -> 完整路径
+        links_map: dict[str, list[str]] = {}
+
+        for path in all_notes:
+            try:
+                content = self.read_note(path)
+                raw_links = self._link_pattern.findall(content)
+
+                # 解析链接目标，转换为实际路径
+                resolved = []
+                for link in raw_links:
+                    # 优先匹配完整路径，其次匹配文件名
+                    if link in all_notes:
+                        resolved.append(link)
+                    elif f"{link}.md" in all_notes:
+                        resolved.append(f"{link}.md")
+                    elif link in note_stems:
+                        resolved.append(note_stems[link])
+
+                links_map[path] = list(set(resolved))
+            except Exception:
+                links_map[path] = []
+
+        return links_map

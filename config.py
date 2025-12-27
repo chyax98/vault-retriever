@@ -10,7 +10,7 @@ class Config:
     """服务器配置"""
     vault_path: Path
     embedding_model: str = "BAAI/bge-small-zh-v1.5"
-    index_interval: int = 300  # 索引更新间隔（秒）
+    index_interval: int = 600  # 索引更新间隔（秒），大型知识库建议 10-15 分钟
 
     @property
     def storage_path(self) -> Path:
