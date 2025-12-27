@@ -25,33 +25,19 @@ uv sync
 
 ## Vault 路径配置
 
-优先级：命令行参数 > 环境变量 > 当前目录
+优先级：命令行参数 > 环境变量 `OBSIDIAN_VAULT_PATH` > 当前目录
 
-```bash
-# 方式 1：命令行参数
-uv run obsidian-vault-mcp --vault /path/to/vault
+## Claude Code 配置
 
-# 方式 2：环境变量
-export OBSIDIAN_VAULT_PATH=/path/to/vault
-uv run obsidian-vault-mcp
-
-# 方式 3：在 vault 目录下直接运行
-cd /path/to/vault
-uv run --directory /path/to/obsidian-mcp obsidian-vault-mcp
-```
-
-## 配置 MCP 客户端
-
-**Claude Code（推荐，使用环境变量）：**
+**方式 1：命令行添加（全局）**
 
 ```bash
 claude mcp add obsidian-vault \
-  --transport stdio \
   -e OBSIDIAN_VAULT_PATH=/path/to/vault \
   -- uv run --directory /path/to/obsidian-mcp obsidian-vault-mcp
 ```
 
-**项目 `.mcp.json`（在 vault 目录下）：**
+**方式 2：项目 `.mcp.json`（放在 vault 目录下）**
 
 ```json
 {
@@ -61,14 +47,33 @@ claude mcp add obsidian-vault \
       "command": "uv",
       "args": ["run", "--directory", "/path/to/obsidian-mcp", "obsidian-vault-mcp"],
       "env": {
-        "OBSIDIAN_VAULT_PATH": "${workspaceFolder}"
+        "OBSIDIAN_VAULT_PATH": "${PWD}"
       }
     }
   }
 }
 ```
 
-> 注：`${workspaceFolder}` 会被替换为当前工作目录（vault 路径）
+> `${PWD}` 会被替换为 Claude Code 启动时的当前工作目录
+
+**方式 3：使用 shell 环境变量**
+
+如果你已经设置了 `OBSIDIAN_VAULT_PATH` 环境变量：
+
+```json
+{
+  "mcpServers": {
+    "obsidian-vault": {
+      "type": "stdio",
+      "command": "uv",
+      "args": ["run", "--directory", "/path/to/obsidian-mcp", "obsidian-vault-mcp"],
+      "env": {
+        "OBSIDIAN_VAULT_PATH": "${OBSIDIAN_VAULT_PATH}"
+      }
+    }
+  }
+}
+```
 
 ## 索引机制
 
