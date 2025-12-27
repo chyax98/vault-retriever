@@ -82,33 +82,48 @@ def create_server(vault_path: Path, config: Config | None = None) -> FastMCP:
     indexer = Indexer(storage, bm25, vector, interval=config.index_interval)
     state = IndexState()
 
-    # 后台初始化索引（不阻塞主线程）
-    def init_index():
-        logger.info("后台初始化索引...")
-        start_total = time.time()
+    # 后台初始化 BM25（快速，几秒完成）
+    def init_bm25():
+        logger.info("后台初始化 BM25...")
+        start = time.time()
 
         docs = vault.load_all_documents()
         doc_contents = {d.path: d.content for d in docs}
         file_stats = {d.path: (d.mtime, len(d.content)) for d in docs}
 
-        # BM25 索引
-        start_bm25 = time.time()
         result = indexer.index_incremental(doc_contents, file_stats)
         if result["status"] == "unchanged":
             bm25.index(doc_contents)
-            logger.info("从缓存恢复 BM25 索引")
-        bm25_time = time.time() - start_bm25
 
-        # BM25 就绪，可以开始搜索
+        bm25_time = time.time() - start
         state.set_bm25_ready(doc_contents)
         state.update_metrics(bm25_index_time=bm25_time)
-        logger.info(f"BM25 索引就绪 ({bm25_time:.2f}s)")
+        logger.info(f"BM25 就绪 ({bm25_time:.2f}s, {len(doc_contents)} 文档)")
 
-        # 向量索引（可选，耗时较长）
-        start_vector = time.time()
-        if not vector.is_indexed():
-            vector.index(doc_contents)
-        vector_time = time.time() - start_vector
+    # 后台初始化向量索引（慢速，可能几分钟）
+    def init_vector():
+        # 等 BM25 先完成
+        while not state.is_bm25_ready():
+            time.sleep(0.5)
+
+        doc_contents = state.get_contents()
+        if not doc_contents:
+            return
+
+        # 检查是否已有向量索引
+        if vector.is_indexed():
+            state.set_vector_ready()
+            state.update_metrics(
+                vector_index_time=0,
+                last_update=time.strftime("%Y-%m-%d %H:%M:%S"),
+            )
+            logger.info("向量索引从缓存加载")
+            return
+
+        logger.info(f"后台构建向量索引 ({len(doc_contents)} 文档)...")
+        start = time.time()
+        vector.index(doc_contents)
+        vector_time = time.time() - start
 
         state.set_vector_ready()
         state.update_metrics(
@@ -116,10 +131,10 @@ def create_server(vault_path: Path, config: Config | None = None) -> FastMCP:
             last_update=time.strftime("%Y-%m-%d %H:%M:%S"),
         )
         logger.info(f"向量索引就绪 ({vector_time:.2f}s)")
-        logger.info(f"索引完成，总耗时 {time.time() - start_total:.2f}s")
 
-    # 启动后台索引线程
-    threading.Thread(target=init_index, daemon=True).start()
+    # 启动后台线程
+    threading.Thread(target=init_bm25, daemon=True).start()
+    threading.Thread(target=init_vector, daemon=True).start()
 
     # 启动定时更新
     def get_docs():

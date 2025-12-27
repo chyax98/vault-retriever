@@ -87,14 +87,11 @@ class Indexer:
         return added, modified, deleted
 
     def index_full(self, documents: dict[str, str], file_stats: dict[str, tuple[float, int]]):
-        """全量索引"""
-        logger.info(f"全量索引 {len(documents)} 个文档")
+        """全量索引（只做 BM25，向量索引单独处理）"""
+        logger.info(f"BM25 全量索引 {len(documents)} 个文档")
 
-        # BM25 索引
+        # 只做 BM25 索引（快速）
         self.bm25.index(documents)
-
-        # 向量索引
-        self.vector.index(documents)
 
         # 更新缓存
         self._file_states = {

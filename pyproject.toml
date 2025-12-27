@@ -1,6 +1,6 @@
 [project]
 name = "obsidian-vault-mcp"
-version = "1.0.1"
+version = "1.0.2"
 description = "Obsidian Vault MCP - 语义搜索和记忆服务"
 readme = "README.md"
 license = "MIT"
