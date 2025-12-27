@@ -203,14 +203,15 @@ def create_server(vault_path: Path, config: Config | None = None) -> FastMCP:
     # MCP 服务器
     mcp = FastMCP(
         name="obsidian-vault-mcp",
-        instructions="Obsidian 知识库搜索服务，提供语义搜索、笔记读取、链接分析等功能。",
+        instructions="""Obsidian 知识库语义搜索服务。当用户询问笔记内容、查找信息或需要知识库上下文时，优先使用 vault_search 进行智能搜索。
+工具推荐顺序：vault_search（搜索）→ vault_read（读取详情）→ vault_links/vault_related（发现关联）。""",
     )
 
     # ========== 工具 ==========
 
     @mcp.tool(
         name="vault_search",
-        description="搜索 Obsidian 笔记。支持关键词(bm25)、语义(semantic)、混合(hybrid)三种模式，默认混合模式效果最佳。"
+        description="""【优先使用】在 Obsidian 知识库中智能搜索笔记。支持自然语言问题，如"如何配置 Docker"、"关于机器学习的笔记"。融合关键词匹配 + 语义理解 + PageRank 权重，返回最相关的笔记路径和内容摘要。"""
     )
     def vault_search(
         query: Annotated[str, Field(description="搜索关键词或问题")],
@@ -282,7 +283,10 @@ def create_server(vault_path: Path, config: Config | None = None) -> FastMCP:
 
     @mcp.tool(
         name="vault_read",
-        description="读取 Obsidian 笔记的完整内容。用于获取搜索结果的详细内容。"
+        description="""读取 Obsidian 笔记的完整 Markdown 内容。
+- 用于获取 vault_search 返回结果的详细内容
+- 支持任意 .md 文件路径
+- 返回完整原文，包括 frontmatter、标题、正文、代码块等"""
     )
     def vault_read(
         path: Annotated[str, Field(description="笔记路径，如 'folder/note.md'")],
@@ -298,7 +302,11 @@ def create_server(vault_path: Path, config: Config | None = None) -> FastMCP:
 
     @mcp.tool(
         name="vault_list",
-        description="列出 Obsidian 知识库中的笔记。可按目录过滤，支持查看最近修改的笔记。"
+        description="""浏览知识库结构，列出笔记文件。
+- 不传参数：列出所有笔记
+- folder 参数：按目录过滤，如 "projects/" 或 "daily/"
+- recent_days 参数：只看最近 N 天修改的笔记
+适合了解知识库整体结构或查找特定目录下的内容。"""
     )
     def vault_list(
         folder: Annotated[str | None, Field(default=None, description="目录路径过滤，如 'projects/'")] = None,
@@ -322,7 +330,10 @@ def create_server(vault_path: Path, config: Config | None = None) -> FastMCP:
 
     @mcp.tool(
         name="vault_links",
-        description="获取笔记的链接关系。返回指向该笔记的反向链接(backlinks)和该笔记引用的出链(outgoing)。"
+        description="""分析笔记的双向链接关系，理解知识图谱结构。
+- backlinks：哪些笔记引用了这篇笔记（被谁引用）
+- outgoing：这篇笔记链接到哪些笔记（引用了谁）
+用于发现笔记之间的关联、追溯知识来源、构建主题地图。"""
     )
     def vault_links(
         path: Annotated[str, Field(description="笔记路径")],
@@ -342,7 +353,10 @@ def create_server(vault_path: Path, config: Config | None = None) -> FastMCP:
 
     @mcp.tool(
         name="vault_tags",
-        description="获取标签信息。不传参数返回所有标签统计，传入标签名返回使用该标签的笔记列表。"
+        description="""按标签组织和查找笔记。
+- 不传参数：返回所有标签及其使用次数统计
+- 传入标签名：返回使用该标签的所有笔记列表
+标签支持带或不带 # 前缀，如 "python" 或 "#python"。"""
     )
     def vault_tags(
         tag: Annotated[str | None, Field(default=None, description="标签名(带或不带#)，不传则返回所有标签")] = None,
@@ -356,7 +370,11 @@ def create_server(vault_path: Path, config: Config | None = None) -> FastMCP:
 
     @mcp.tool(
         name="vault_related",
-        description="查找与指定笔记语义相似的其他笔记。基于向量相似度，适合发现相关内容。"
+        description="""发现与指定笔记语义相似的相关笔记。
+- 基于向量嵌入计算内容相似度
+- 能发现主题相近但没有直接链接的笔记
+- 适合拓展阅读、发现隐藏关联、完善知识网络
+与 vault_links 互补：links 看显式链接，related 看隐式语义关联。"""
     )
     def vault_related(
         path: Annotated[str, Field(description="笔记路径")],

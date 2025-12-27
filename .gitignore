@@ -24,3 +24,4 @@ ENV/
 # 数据文件（在 vault 内）
 *.lance/
 index_cache.json
+.obsidian/
