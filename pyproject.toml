@@ -28,6 +28,11 @@ dependencies = [
     "scipy>=1.16.3",
 ]
 
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0.0",
+]
+
 [project.urls]
 Homepage = "https://github.com/chyax98/vault-retriever"
 Repository = "https://github.com/chyax98/vault-retriever"
@@ -36,7 +41,7 @@ Repository = "https://github.com/chyax98/vault-retriever"
 vault-retriever = "server:main"
 
 [tool.hatch.build.targets.wheel]
-packages = ["server.py", "config.py", "vault", "search", "memory"]
+packages = ["server.py", "config.py", "vault", "search"]
 
 [build-system]
 requires = ["hatchling"]

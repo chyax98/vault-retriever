@@ -61,14 +61,6 @@ class VaultReader:
                 continue
         return docs
 
-    def get_file_hash(self, path: str) -> tuple[float, int]:
-        """获取文件 mtime 和 size 用于缓存验证"""
-        file_path = self.vault_path / path
-        if not file_path.exists():
-            return (0, 0)
-        stat = file_path.stat()
-        return (stat.st_mtime, stat.st_size)
-
     def get_links(self, path: str) -> LinkInfo:
         """获取笔记的链接信息"""
         content = self.read_note(path)
@@ -120,25 +112,6 @@ class VaultReader:
             except Exception:
                 continue
         return results
-
-    def find_orphans(self) -> list[str]:
-        """查找孤立笔记（没有被任何其他笔记链接）"""
-        all_notes = set(self.list_notes())
-        linked_notes = set()
-
-        for path in all_notes:
-            try:
-                content = self.read_note(path)
-                links = self._link_pattern.findall(content)
-                for link in links:
-                    # 尝试匹配完整路径或文件名
-                    for note in all_notes:
-                        if Path(note).stem == link or note == link or note == f"{link}.md":
-                            linked_notes.add(note)
-            except Exception:
-                continue
-
-        return list(all_notes - linked_notes)
 
     def get_recent_notes(self, days: int = 7, limit: int = 20) -> list[dict]:
         """获取最近修改的笔记"""

@@ -134,28 +134,25 @@ class Indexer:
 
         # 删除
         for path in deleted:
-            self.bm25.remove(path)
             self.vector.remove(path)
             if path in self._file_states:
                 del self._file_states[path]
 
-        # 添加和修改 - 批量处理
+        # 重建 BM25 索引（删除、添加、修改都需要重建）
+        self.bm25.index(all_docs)
+
+        # 更新向量索引（仅当向量索引已就绪时）
         to_update = added + modified
-        if to_update:
-            # 更新 BM25（直接使用完整文档集重建）
-            self.bm25.index(all_docs)
-
-            # 更新向量索引（仅当向量索引已就绪时）
-            if self._vector_ready_fn():
-                for path in modified:
-                    self.vector.remove(path)
-                for path in to_update:
-                    self.vector.add(path, all_docs[path])
-
-            # 更新缓存状态
+        if to_update and self._vector_ready_fn():
+            for path in modified:
+                self.vector.remove(path)
             for path in to_update:
-                mtime, size = file_stats[path]
-                self._file_states[path] = FileState(mtime=mtime, size=size)
+                self.vector.add(path, all_docs[path])
+
+        # 更新缓存状态
+        for path in to_update:
+            mtime, size = file_stats[path]
+            self._file_states[path] = FileState(mtime=mtime, size=size)
 
         self._save_cache()
 

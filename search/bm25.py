@@ -30,16 +30,6 @@ class BM25Search:
         self.paths: list[str] = []  # 文档路径列表
         self._indexed = False
 
-    def _tokenize(self, texts: list[str]) -> list[list[str]]:
-        """中文分词"""
-        result = []
-        for text in texts:
-            # 清理特殊字符
-            text = re.sub(r'[#\[\](){}]', ' ', text)
-            tokens = list(jieba.cut(text))
-            result.append(tokens)
-        return result
-
     def _tokenize_single(self, text: str) -> list[str]:
         """单条文本分词"""
         text = re.sub(r'[#\[\](){}]', ' ', text)
@@ -68,11 +58,8 @@ class BM25Search:
             self._indexed = False
             return
 
-        # 分词
-        contents = [documents[p] for p in self.paths]
-        corpus_tokens = self._tokenize(contents)
-
         # 创建 BM25 索引
+        contents = [documents[p] for p in self.paths]
         self.retriever = bm25s.BM25()
         self.retriever.index(bm25s.tokenize(contents, stemmer=None, stopwords=None, show_progress=False))
         self._indexed = True
@@ -175,7 +162,7 @@ class BM25Search:
 
         return results
 
-    @property
-    def documents(self) -> dict[str, str]:
-        """兼容旧接口（返回空字典，不存储原始文档）"""
-        return {}
+    def remove(self, path: str):
+        """移除文档（仅从路径列表中移除，需配合 index 重建索引）"""
+        if path in self.paths:
+            self.paths.remove(path)
